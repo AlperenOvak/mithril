@@ -4,6 +4,7 @@ from mithril.framework.common import IOKey
 from mithril.models import (
     Model,
     Linear,
+    SiLU,
     Embedding,
     Add,
     Arange,
@@ -195,3 +196,43 @@ def llama_attention(
         input="attn_reshaped", output="output"
     )
     return attn
+
+def llama_feed_forward(name: str, dim: int, hidden_dim: int):
+    """
+    Implements the FFN: output = Linear(hidden_dim, dim)( SiLU(Linear(dim, hidden_dim)(x)) * Linear(dim, hidden_dim)(x) )
+    """
+    ffn = Model(name=name)
+    ffn += Linear(dim, hidden_dim, name="w1", use_bias=False)(input="input", output="ffn_w1")
+    ffn += SiLU(name="silu")(input="ffn_w1", output="ffn_silu")
+    ffn += Linear(dim, hidden_dim, name="w3", use_bias=False)(input="input", output="ffn_w3")
+    ffn += Multiply(name="mul")(["ffn_silu", "ffn_w3"], output="ffn_mul")
+    ffn += Linear(hidden_dim, dim, name="w2", use_bias=False)(input="ffn_mul", output="ffn_out")
+    return ffn
+
+
+def transformer_block(
+    name: str,
+    dim: int,
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+    hidden_dim: int,
+    norm_eps: float,
+    rope_theta: float,
+    rope_traditional: bool = True,
+):
+    """
+    A single transformer block: (attention + residual) then (FFN + residual).
+    Uses RMSNorm before attention and before the FFN.
+    """
+    block = Model(name=name)
+    # Attention sub-block
+    block += RMSNorm(dim, eps=norm_eps, name="attn_norm")(input="input", output="norm1")
+    block += llama_attention(
+        "attention", dim, n_heads, n_kv_heads, head_dim, rope_theta, rope_traditional
+    )(input="norm1", output="attn_out")
+    block += Add(name="residual1")(["input", "attn_out"], output="res1")
+    block += RMSNorm(dim, eps=norm_eps, name="ffn_norm")(input="res1", output="norm2")
+    block += llama_feed_forward("ffn", dim, hidden_dim)(input="norm2", output="ffn_out")
+    block += Add(name="residual2")(["res1", "ffn_out"], output="output")
+    return block
