@@ -236,3 +236,47 @@ def transformer_block(
     block += llama_feed_forward("ffn", dim, hidden_dim)(input="norm2", output="ffn_out")
     block += Add(name="residual2")(["res1", "ffn_out"], output="output")
     return block
+
+
+def llama_model(
+    vocab_size: int,
+    dim: int,
+    n_layers: int,
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+    hidden_dim: int,
+    norm_eps: float,
+    rope_theta: float,
+    rope_traditional: bool = True,
+):
+    model = Model(name="llama")
+    
+    # Token and positional embeddings
+    model += Embedding(name="tok_embeddings", num_embeddings=vocab_size, dim=dim)(
+        input="input_ids", output="embedded_tokens"
+    )
+    
+    # Transformer blocks
+    layers = Model(name="layers")
+    for i in range(n_layers):
+        layers += transformer_block(
+            name=f"layer_{i}",
+            dim=dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            hidden_dim=hidden_dim,
+            norm_eps=norm_eps,
+            rope_theta=rope_theta,
+            rope_traditional=rope_traditional,
+        )(input="layer_in", output="layer_out")
+        layers.set_cin("layer_in")
+    
+    model += layers(input="embedded_tokens")
+    
+    # Final normalization and output layer
+    model += RMSNorm(dim, eps=norm_eps, name="final_norm")(input="layer_out", output="norm_out")
+    model += Linear(dim, vocab_size, name="output_layer")(input="norm_out", output="logits")
+    
+    return model
