@@ -1,5 +1,10 @@
 
 from numpy import expand_dims
+import mithril as ml
+import json
+import math
+from pathlib import Path
+from typing import Any
 from mithril.framework.common import IOKey
 from mithril.models import (
     Model,
@@ -17,6 +22,7 @@ from mithril.models import (
     Softmax,
     Concat,
     Buffer,
+    
 )
 from mithril.utils import tree_unflatten
 
@@ -126,76 +132,63 @@ def RepeatBlock(repeats: int, axis: int, new_shape: list, name: str = None) -> M
     return block
 
 def llama_attention(
-    name: str,
-    dim: int,
-    n_heads: int,
-    n_kv_heads: int,
-    head_dim: int,
-    rope_theta: float,
-    rope_traditional: bool = True,
+    args: dict[str, Any],
+    use_mask: bool = False,
+    *,
+    name: str | None = None,
 ):
-    """
-    Builds the attention block in Mithril.
-    This function projects the input to Q, K, V, reshapes them, applies RoPE,
-    computes scaled dot-product attention and then projects the result back.
-    """
-    attn = Model(name=name)
-    # --- Projections for Q, K, V ---
-    attn += Linear(dim, n_heads * head_dim, name="wq", use_bias=False)(input="input", output="q")
-    attn += Linear(dim, n_kv_heads * head_dim, name="wk", use_bias=False)(input="input", output="k")
-    attn += Linear(dim, n_kv_heads * head_dim, name="wv", use_bias=False)(input="input", output="v")
+    n_heads = args["n_heads"]
+    n_kv_heads = args["n_kv_heads"]
+    head_dim = args["head_dim"]
+    dim = args["dim"]
+    rope_traditional = args["rope_traditional"]
+    rope_theta = args["rope_theta"]
 
-    # --- Reshape and transpose projections ---
-    # For queries: [B, L, n_heads, head_dim] -> transpose to [B, n_heads, L, head_dim]
-    attn += Reshape((-1, -1, n_heads, head_dim), name="reshape_q")(input="q", output="q_reshaped")
-    attn += Transpose((0, 2, 1, 3), name="transpose_q")(input="q_reshaped", output="q_transposed")
-
-    # For keys and values: [B, L, n_kv_heads, head_dim] -> transpose to [B, n_kv_heads, L, head_dim]
-    attn += Reshape((-1, -1, n_kv_heads, head_dim), name="reshape_k")(input="k", output="k_reshaped")
-    attn += Transpose((0, 2, 1, 3), name="transpose_k")(input="k_reshaped", output="k_transposed")
-    attn += Reshape((-1, -1, n_kv_heads, head_dim), name="reshape_v")(input="v", output="v_reshaped")
-    attn += Transpose((0, 2, 1, 3), name="transpose_v")(input="v_reshaped", output="v_transposed")
-
-    # --- Repeat keys and values to match number of heads ---
     repeats = n_heads // n_kv_heads
-    attn += RepeatBlock(repeats=repeats, axis=1, name="repeat_k")(input="k_transposed", output="k_repeated")
-    attn += RepeatBlock(repeats=repeats, axis=1, name="repeat_v")(input="v_transposed", output="v_repeated")
+    scale = head_dim**-0.5
 
-    # --- Apply RoPE to queries and keys ---
-    attn += RoPE(head_dim, traditional=rope_traditional, base=rope_theta, name="rope_q")(
-        input="q_transposed", output="q_rope"
-    )
-    attn += RoPE(head_dim, traditional=rope_traditional, base=rope_theta, name="rope_k")(
-        input="k_repeated", output="k_rope"
-    )
+    block = Model(name=name)
+    x = IOKey("x", shape=(None, None, dim))
 
-    # --- Scale queries ---
-    scale = head_dim ** -0.5
-    attn += Multiply(scalar=scale, name="scale_q")(input="q_rope", output="q_scaled")
+    block += Linear(n_heads * head_dim, name="wq", use_bias=False)(x, output="queries")
+    block += Linear(n_kv_heads * head_dim, name="wk", use_bias=False)(x, output="keys")
+    block += Linear(n_kv_heads * head_dim, name="wv", use_bias=False)(x, output="values")
 
-    # --- Compute attention scores ---
-    # Transpose keys for dot-product: [B, n_heads, L, head_dim] -> [B, n_heads, head_dim, L]
-    attn += Transpose((0, 1, 3, 2), name="transpose_k_for_attn")(
-        input="k_rope", output="k_for_attn"
-    )
-    # Compute dot-product attention with causal masking.
-    attn += ScaledDotProduct(is_causal=True, name="scaled_dot")(
-        query="q_scaled", key="k_for_attn", value="v_repeated", output="attn_output"
-    )
+    queries: ml.Connection = block.queries  # type: ignore
+    keys: ml.Connection = block.keys  # type: ignore
+    values: ml.Connection = block.values  # type: ignore
 
-    # --- Reshape back to [B, L, n_heads * head_dim] ---
-    attn += Transpose((0, 2, 1, 3), name="transpose_back")(
-        input="attn_output", output="attn_transposed"
-    )
-    attn += Reshape((-1, -1, n_heads * head_dim), name="reshape_out")(
-        input="attn_transposed", output="attn_reshaped"
-    )
+    B, L = queries.shape[0], queries.shape[1]
+    queries = queries.reshape((B, L, n_heads, -1)).transpose((0, 2, 1, 3))  # type: ignore
+    keys = keys.reshape((B, L, n_kv_heads, -1)).transpose((0, 2, 1, 3))  # type: ignore
+    values = values.reshape((B, L, n_kv_heads, -1)).transpose((0, 2, 1, 3))  # type: ignore
+    
+    def repeat(a, repeats):
+        expanded = [a.expand_dims(2)] * repeats
+        block += Concat(n=repeats, axis=2)(*expanded, output="repeated")
+        return block.repeated.reshape((B, n_heads, L, -1))
+    
+    keys, values = map(repeat, (keys, values))
 
-    # --- Final linear projection ---
-    attn += Linear(n_heads * head_dim, dim, name="wo", use_bias=False)(
-        input="attn_reshaped", output="output"
+    block += RoPE()(
+        xq=queries, xk=keys, freqs_cis="pe", xq_out="queries_out", xk_out="keys_out"
     )
-    return attn
+    queries = block.queries_out
+    keys = block.keys_out
+
+    scores = (queries * scale) @ keys.transpose((0, 1, 3, 2))
+    if use_mask:
+        scores = scores + IOKey("mask").cast(scores.dtype())
+
+    block += Softmax(axis=-1)(scores.cast(ml.float32), output="attention_weights")
+
+    scores = block.attention_weights.cast(scores.dtype())  # type: ignore
+    output = (scores @ values).transpose((0, 2, 1, 3)).reshape((B, L, -1))
+    block += Linear(dim, name="wo", use_bias=False)(output, output=IOKey("output"))
+    block += Buffer()(keys, output=IOKey("keys_out"))
+    block += Buffer()(values, output=IOKey("values_out"))
+
+    return block
 
 def llama_feed_forward(name: str, dim: int, hidden_dim: int):
     """
