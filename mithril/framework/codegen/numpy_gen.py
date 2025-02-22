@@ -35,7 +35,7 @@ from ..common import (
     find_intersection_type,
     is_type_adjustment_required,
 )
-from ..logical import PrimitiveModel
+from ..logical import Operator
 from .python_gen import PythonCodeGen, RawGradientType
 from .utils import check_repr_inequality
 
@@ -142,7 +142,7 @@ class NumpyCodeGen(PythonCodeGen[np.ndarray[Any, Any]]):
                 data = {}
             # TODO: Consider not unioning batch data (data) into self.data
             # If evaluate_gradients called directly, first call evaluate.
-            cached_data = self.pm.data_store.data_values
+            cached_data = self.pm.flat_graph.cached_data
 
             output: dict[str, np.ndarray[Any, Any]] = eval_fn(
                 params=params, data=data, cache=cached_data
@@ -151,8 +151,8 @@ class NumpyCodeGen(PythonCodeGen[np.ndarray[Any, Any]]):
             gradients: dict[str, np.ndarray[Any, Any]] = {}
             for key in (
                 self.pm.flat_graph.all_keys
-                - self.pm.data_store.all_static_keys
-                - self.pm.data_store.unused_keys
+                - self.pm.flat_graph.all_static_keys
+                - self.pm.flat_graph.unused_keys
                 - self.pm.ignore_grad_keys
             ):
                 key_cache = cached_data.get(key + "_cache", {})
@@ -212,11 +212,11 @@ class NumpyCodeGen(PythonCodeGen[np.ndarray[Any, Any]]):
 
     def get_primitive_details(
         self, output_key: str
-    ) -> tuple[PrimitiveModel, list[str], list[str]]:
+    ) -> tuple[Operator, list[str], list[str]]:
         model = self.pm.flat_graph.get_model(output_key)
 
         global_input_keys = self.pm.flat_graph.get_source_keys(output_key)
-        global_input_keys += [self.get_cache_name(output_key, model)]
+        global_input_keys += [self.get_cache_name(output_key)]
         local_input_keys = list(model.input_keys) + ["cache"]
 
         return model, global_input_keys, local_input_keys
@@ -229,7 +229,7 @@ class NumpyCodeGen(PythonCodeGen[np.ndarray[Any, Any]]):
 
     def call_primitive(
         self,
-        model: PrimitiveModel,
+        model: Operator,
         fn: Callable[..., Any],
         l_input_keys: list[str],
         g_input_keys: list[str],
@@ -259,7 +259,7 @@ class NumpyCodeGen(PythonCodeGen[np.ndarray[Any, Any]]):
         return ast.Assign(targets, generated_fn), used_keys | _used_keys
 
     def create_primitive_call_targets(
-        self, output_key: str, model: PrimitiveModel, inference: bool
+        self, output_key: str, model: Operator, inference: bool
     ) -> tuple[list[ast.expr | ast.Name], set[str]]:
         targets: list[ast.expr | ast.Name] = []
 
@@ -271,30 +271,29 @@ class NumpyCodeGen(PythonCodeGen[np.ndarray[Any, Any]]):
 
         if not self.pm.inference:
             # TODO: Change this with cache refactor
-            cache_name = output_key + f"_{model.cache_name}"
+            cache_name = output_key + f"_{Operator.cache_name}"
             used_keys.add(cache_name)
             targets.append(
                 ast.Subscript(
                     value=ast.Name(id=cache_name, ctx=ast.Load()),
-                    slice=ast.Constant(value=PrimitiveModel.output_key),
+                    slice=ast.Constant(value=Operator.output_key),
                     ctx=ast.Store(),
                 )
             )
 
         return targets, used_keys
 
-    def get_cache_name(self, output_key: str, model: PrimitiveModel) -> str:
-        cache_name = "_".join([output_key, model.cache_name])
-        if cache_name not in self.pm.data_store._all_data:
-            self.add_cache(model, output_key)
+    def get_cache_name(self, output_key: str) -> str:
+        cache_name = "_".join([output_key, Operator.cache_name])
+        if cache_name not in self.pm.flat_graph.all_data:
+            self.add_cache(output_key, cache_name)
 
         return cache_name
 
-    def add_cache(self, model: PrimitiveModel, output_key: str) -> None:
-        cache_name = "_".join([output_key, model.cache_name])
+    def add_cache(self, output_key: str, cache_name: str) -> None:
         cache_value: dict[str, Any] | None = None if self.pm.inference else {}
         # Create a scalar for caches in manualgrad backend.
-        self.pm.data_store.update_data(
+        self.pm.flat_graph.update_data(
             {cache_name: IOHyperEdge(dict | None, cache_value)}
         )
 
@@ -305,11 +304,7 @@ class NumpyCodeGen(PythonCodeGen[np.ndarray[Any, Any]]):
         function_body: list[ast.stmt] = []
         used_keys: set[str] = set()
 
-        all_ignored_keys = (
-            ignore_grad_keys
-            | self.pm.data_store.all_static_keys
-            | self.pm.data_store.unused_keys
-        )
+        all_ignored_keys = ignore_grad_keys | self.pm.flat_graph.all_static_keys
 
         # TODO: Is this should be here?
         # Seperate ignored keys into two types of weak and strict ignored keys.
@@ -321,17 +316,9 @@ class NumpyCodeGen(PythonCodeGen[np.ndarray[Any, Any]]):
             and find_intersection_type(self.pm.data[key].value_type, float)
         }
 
-        # weak_ignored_keys = set()
-        # for key in all_ignored_keys:
-        #     if key in self.pm.data:
-        #         edge = self.pm.data[key]
-        #         if isinstance(edge._value, Tensor):
-        #             if find_intersection_type(edge._value.type, float):
-        #                     weak_ignored_keys |= {key}
-
         strict_ignored_keys = all_ignored_keys - weak_ignored_keys
 
-        ignore_grad_keys, _ = self.pm.infer_ignore(
+        ignore_grad_keys, _ = self.pm.flat_graph.infer_ignore(
             weak_ignored_keys,
             self.pm._output_keys,
             strict_ignored_keys,
@@ -413,7 +400,7 @@ class NumpyCodeGen(PythonCodeGen[np.ndarray[Any, Any]]):
                 )
             }
             args, kwargs = prepare_function_args(
-                self.pm.data_store.data_values,
+                self.pm.flat_graph.cached_data,
                 primitive_function,
                 local_to_global_dict,
                 self.backend.array_creation_funcs,
@@ -450,7 +437,7 @@ class NumpyCodeGen(PythonCodeGen[np.ndarray[Any, Any]]):
             for idx, global_input_key in enumerate(global_input_keys[:-2]):
                 if (
                     global_input_key
-                    in ignore_grad_keys | self.pm.data_store.runtime_static_keys
+                    in ignore_grad_keys | self.pm.flat_graph.runtime_static_keys
                 ):
                     continue
 
@@ -538,10 +525,10 @@ class NumpyCodeGen(PythonCodeGen[np.ndarray[Any, Any]]):
             if (
                 key
                 in self.pm.flat_graph.all_target_keys
-                | self.pm.data_store.cached_data.keys()
+                | self.pm.flat_graph.cached_data.keys()
             ):
                 dict_type = "cache"
-            elif key in self.pm.data_store.runtime_static_keys:
+            elif key in self.pm.flat_graph.runtime_static_keys:
                 dict_type = "data"
             else:
                 dict_type = "params"

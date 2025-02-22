@@ -28,7 +28,7 @@ from mithril.framework.common import (
     Uniadic,
     find_intersection_type,
 )
-from mithril.framework.logical import BaseModel, Model, PrimitiveModel
+from mithril.framework.logical import BaseModel, Model, Operator
 from mithril.framework.physical import PhysicalModel
 from mithril.framework.utils import find_type
 from mithril.models.train_model import TrainModel
@@ -266,12 +266,12 @@ def assert_results_equal(*args):
 def assert_metadata_equal(*args):
     first_conn, other_conns = args[0], args[1:]
     for other_conn in other_conns:
-        assert first_conn.data.metadata == other_conn.data.metadata
+        assert first_conn.metadata == other_conn.metadata
 
 
 def get_all_data(model: BaseModel) -> set[IOHyperEdge]:
     # recursively gets the all data in the model (Tensor or Scalar)
-    if isinstance(model, PrimitiveModel):
+    if isinstance(model, Operator):
         return {model.conns.get_data(key) for key in model.conns.all}
     assert isinstance(model, Model)
     data = set()
@@ -282,7 +282,7 @@ def get_all_data(model: BaseModel) -> set[IOHyperEdge]:
 
 def get_all_metadata(model: BaseModel) -> set[IOHyperEdge | None]:
     # recursively gets the all metadata in the model (IOHyperEdge)
-    if isinstance(model, PrimitiveModel):
+    if isinstance(model, Operator):
         return {model.conns.get_metadata(key) for key in model.conns.all}
     assert isinstance(model, Model)
     data = set()
