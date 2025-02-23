@@ -25,51 +25,47 @@ def evaluate(params, data, cache):
     del output_8
     output_11 = reshape(output_9, (2, 4, 1, 16, -1))
     del output_9
-    output_12 = multiplication(output_11, 2)
+    keys_repeated = make_array(concat(output_11, output_11, axis=2))
     del output_11
-    keys_repeated = make_array(concat(output_12, output_12, axis=2))
-    del output_12
-    output_14 = reshape(values, (2, 16, 4, -1))
+    output_13 = reshape(values, (2, 16, 4, -1))
     del values
-    output_15 = transpose(output_14, (0, 2, 1, 3))
+    output_14 = transpose(output_13, (0, 2, 1, 3))
+    del output_13
+    output_16 = reshape(output_14, (2, 4, 1, 16, -1))
     del output_14
-    output_17 = reshape(output_15, (2, 4, 1, 16, -1))
-    del output_15
-    output_18 = multiplication(output_17, 2)
-    del output_17
-    values_repeated = make_array(concat(output_18, output_18, axis=2))
-    del output_18
-    output_20 = reshape(queries, (2, 16, 8, -1))
+    values_repeated = make_array(concat(output_16, output_16, axis=2))
+    del output_16
+    output_18 = reshape(queries, (2, 16, 8, -1))
     del queries
-    output_21 = transpose(output_20, (0, 2, 1, 3))
-    del output_20
-    output_23 = reshape(keys_repeated, (2, 8, 16, -1))
-    xq_ = reshape(output_21, (2, 8, 16, 32, 2))
+    output_19 = transpose(output_18, (0, 2, 1, 3))
+    del output_18
+    output_21 = reshape(keys_repeated, (2, 8, 16, -1))
+    xq_ = reshape(output_19, (2, 8, 16, 32, 2))
+    del output_19
+    xk_ = reshape(output_21, (2, 8, 16, 32, 2))
     del output_21
-    xk_ = reshape(output_23, (2, 8, 16, 32, 2))
-    del output_23
     freqs_split = split(freqs_cis, 2, -1)
-    output_35 = make_array(indexer(freqs_split, 0))
-    freqs_cos = reshape(output_35, (1, 1, 16, 32, 1))
-    del output_35
-    output_37 = make_array(indexer(freqs_split, 1))
+    output_33 = make_array(indexer(freqs_split, 0))
+    freqs_cos = reshape(output_33, (1, 1, 16, 32, 1))
+    del output_33
+    output_35 = make_array(indexer(freqs_split, 1))
     del freqs_split
-    freqs_sin = reshape(output_37, (1, 1, 16, 32, 1))
-    del output_37
+    freqs_sin = reshape(output_35, (1, 1, 16, 32, 1))
+    del output_35
     xq_split = split(xq_, 2, -1)
     del xq_
-    output_39 = indexer(xq_split, 0)
-    cos_xq_real = make_array(multiplication(freqs_cos, output_39))
-    output_40 = indexer(xq_split, 1)
+    output_37 = indexer(xq_split, 0)
+    cos_xq_real = make_array(multiplication(freqs_cos, output_37))
+    output_38 = indexer(xq_split, 1)
     del xq_split
-    sin_xq_imag = make_array(multiplication(freqs_sin, output_40))
+    sin_xq_imag = make_array(multiplication(freqs_sin, output_38))
     xq_out_real = make_array(subtract(cos_xq_real, sin_xq_imag))
     del cos_xq_real
     del sin_xq_imag
-    sin_xq_real = make_array(multiplication(freqs_sin, output_39))
-    del output_39
-    cos_xq_imag = make_array(multiplication(freqs_cos, output_40))
-    del output_40
+    sin_xq_real = make_array(multiplication(freqs_sin, output_37))
+    del output_37
+    cos_xq_imag = make_array(multiplication(freqs_cos, output_38))
+    del output_38
     xq_out_imag = make_array(add(sin_xq_real, cos_xq_imag))
     del sin_xq_real
     del cos_xq_imag
@@ -80,47 +76,51 @@ def evaluate(params, data, cache):
     del xq_out_combined
     xk_split = split(xk_, 2, -1)
     del xk_
-    output_42 = indexer(xk_split, 0)
-    cos_xk_real = make_array(multiplication(freqs_cos, output_42))
-    del freqs_cos
-    del output_42
-    output_43 = indexer(xk_split, 1)
+    output_40 = indexer(xk_split, 0)
+    cos_xk_real = make_array(multiplication(freqs_cos, output_40))
+    output_41 = indexer(xk_split, 1)
     del xk_split
-    sin_xk_imag = make_array(multiplication(freqs_sin, output_43))
-    del freqs_sin
-    del output_43
+    sin_xk_imag = make_array(multiplication(freqs_sin, output_41))
     xk_out_real = make_array(subtract(cos_xk_real, sin_xk_imag))
-    xk_out_imag = make_array(add(cos_xk_real, sin_xk_imag))
     del cos_xk_real
     del sin_xk_imag
+    sin_xk_real = make_array(multiplication(freqs_sin, output_40))
+    del freqs_sin
+    del output_40
+    cos_xk_imag = make_array(multiplication(freqs_cos, output_41))
+    del freqs_cos
+    del output_41
+    xk_out_imag = make_array(add(sin_xk_real, cos_xk_imag))
+    del sin_xk_real
+    del cos_xk_imag
     xk_out_combined = make_array(concat(xk_out_real, xk_out_imag, axis=-1))
     del xk_out_real
     del xk_out_imag
     xk_out = reshape(xk_out_combined, (2, 8, 16, 64))
     del xk_out_combined
-    output_45 = multiplication(xq_out, 0.125)
+    output_43 = multiplication(xq_out, 0.125)
     del xq_out
-    output_46 = transpose(xk_out, (0, 1, 3, 2))
-    output_47 = make_array(matrix_multiplication(output_45, output_46))
-    del output_45
+    output_44 = transpose(xk_out, (0, 1, 3, 2))
+    output_45 = make_array(matrix_multiplication(output_43, output_44))
+    del output_43
+    del output_44
+    output_46 = cast(output_45, _dtype)
+    attention_weights = softmax(output_46)
     del output_46
-    output_48 = cast(output_47, _dtype)
-    attention_weights = softmax(output_48)
-    del output_48
-    output_49 = dtype(output_47)
-    del output_47
-    output_50 = cast(attention_weights, output_49)
+    output_47 = dtype(output_45)
+    del output_45
+    output_48 = cast(attention_weights, output_47)
     del attention_weights
-    del output_49
-    output_52 = reshape(values_repeated, (2, 8, 16, -1))
-    output_53 = make_array(matrix_multiplication(output_50, output_52))
-    del output_50
-    output_54 = transpose(output_53, (0, 2, 1, 3))
-    del output_53
-    output_56 = reshape(output_54, (2, 16, -1))
+    del output_47
+    output_50 = reshape(values_repeated, (2, 8, 16, -1))
+    output_51 = make_array(matrix_multiplication(output_48, output_50))
+    del output_48
+    output_52 = transpose(output_51, (0, 2, 1, 3))
+    del output_51
+    output_54 = reshape(output_52, (2, 16, -1))
+    del output_52
+    output_55 = transpose(weight_3, None)
+    output = make_array(matrix_multiplication(output_54, output_55))
     del output_54
-    output_57 = transpose(weight_3, None)
-    output = make_array(matrix_multiplication(output_56, output_57))
-    del output_56
-    del output_57
-    return {'keys_out': xk_out, 'keys_repeated': keys_repeated, 'output': output, 'values_out': output_52, 'values_repeated': values_repeated}
+    del output_55
+    return {'keys_out': xk_out, 'keys_repeated': keys_repeated, 'output': output, 'values_out': output_50, 'values_repeated': values_repeated}

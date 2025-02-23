@@ -124,8 +124,8 @@ def apply_rotary_pos_emb():
     block |= Multiply()(block.freqs_sin, xk_imag, output="sin_xk_imag")
     block |= Subtract()(block.cos_xk_real, block.sin_xk_imag, output="xk_out_real")
 
-    block |= Multiply()(block.freqs_cos, xk_real, output="sin_xk_real")
-    block |= Multiply()(block.freqs_sin, xk_imag, output="cos_xk_imag")
+    block |= Multiply()(block.freqs_sin, xk_real, output="sin_xk_real")
+    block |= Multiply()(block.freqs_cos, xk_imag, output="cos_xk_imag")
     block |= Add()(block.sin_xk_real, block.cos_xk_imag, output="xk_out_imag")
 
     xks = {"input1":block.xk_out_real, "input2":block.xk_out_imag}
@@ -168,23 +168,22 @@ def llama_attention(
     queries = queries.reshape((B, L, n_heads, -1)).transpose((0, 2, 1, 3))  # type: ignore
     keys    = keys.reshape((B, L, n_kv_heads, -1)).transpose((0, 2, 1, 3))  # type: ignore
     values  = values.reshape((B, L, n_kv_heads, -1)).transpose((0, 2, 1, 3))  # type: ignore
+
     
-    keys   = keys.reshape((B, n_kv_heads, 1, L, -1)) * repeats  # type: ignore
+    keys   = keys.reshape((B, n_kv_heads, 1, L, -1)) # * repeats  # type: ignore
     concat_keys= {f"input{idx+1}": keys for idx in range(repeats)}
     block |= Concat(n=repeats, axis=2)(**concat_keys, output=IOKey("keys_repeated"))
     keys = block.keys_repeated.reshape((B, n_heads, L, -1))
 
-    values = values.reshape((B, n_kv_heads, 1, L, -1)) * repeats  # type: ignore
+    values = values.reshape((B, n_kv_heads, 1, L, -1)) # * repeats  # type: ignore
     concat_values= {f"input{idx+1}": values for idx in range(repeats)}
     block |= Concat(n=repeats, axis=2)(**concat_values, output=IOKey("values_repeated"))
     values = block.values_repeated.reshape((B, n_heads, L, -1))
 
+
     block |= apply_rotary_pos_emb()(
         xq=queries, xk=keys, freqs_cis=freqs_cis, xq_out="xq_out", xk_out="xk_out"
     )
-
-    """block |= rope(dim, rope_theta, name="rope")(block.xq_out, output="queries")
-    block |= rope(dim, rope_theta, name="rope")(block.xk_out, output="keys")"""
     
     queries = block.xq_out
     keys = block.xk_out    
@@ -202,45 +201,6 @@ def llama_attention(
     block |= Buffer()(values, output=IOKey("values_out"))
 
     return block
-
-# Define the same logic in NumPy
-def numpy_attention(x, args):
-    n_heads = args["n_heads"]
-    n_kv_heads = args["n_kv_heads"]
-    head_dim = args["head_dim"]
-    dim = args["dim"]
-
-    repeats = n_heads // n_kv_heads
-    scale = head_dim**-0.5
-
-    wq = np.random.rand(dim, n_heads * head_dim).astype(np.float32)
-    wk = np.random.rand(dim, n_kv_heads * head_dim).astype(np.float32)
-    wv = np.random.rand(dim, n_kv_heads * head_dim).astype(np.float32)
-    wo = np.random.rand(n_heads * head_dim, dim).astype(np.float32)
-
-    queries = np.dot(x, wq)
-    keys = np.dot(x, wk)
-    values = np.dot(x, wv)
-
-    B, L, _ = queries.shape
-    queries = queries.reshape(B, L, n_heads, -1).transpose(0, 2, 1, 3)
-    keys = keys.reshape(B, L, n_kv_heads, -1).transpose(0, 2, 1, 3)
-    values = values.reshape(B, L, n_kv_heads, -1).transpose(0, 2, 1, 3)
-
-    def repeat(a, repeats):
-        expanded = np.concatenate([np.expand_dims(a, 2)] * repeats, axis=2)
-        return expanded.reshape(B, n_heads, L, -1)
-
-    keys = repeat(keys, repeats)
-    values = repeat(values, repeats)
-
-    scores = np.matmul(queries * scale, keys.transpose(0, 1, 3, 2))
-    scores = F.softmax(torch.tensor(scores), dim=-1).numpy()
-
-    output = np.matmul(scores, values).transpose(0, 2, 1, 3).reshape(B, L, -1)
-    output = np.dot(output, wo)
-
-    return output
 
 numpy_backend = ml.NumpyBackend()
 model = llama_attention(args)
@@ -310,8 +270,8 @@ def attention_numpy(params, args, x: np.ndarray, freqs_cis: np.ndarray):
 numpy_output = attention_numpy(params, args,x , freqs_cis)
 
 # Compare the results
-print("Mithril Output:", mithril_output)
-print("NumPy Output:", numpy_output)
+print("Mithril Output:", mithril_output["output"].shape )
+print("NumPy Output:", numpy_output.shape)
 print("Difference:", np.mean(np.abs(mithril_output["output"] - numpy_output)))
 
 
