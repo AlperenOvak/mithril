@@ -1,11 +1,19 @@
 
-from numpy import expand_dims
+import numpy as np
+import sys
+import os
+
+# Get the absolute path of the mithril directory
+MITHRIL_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))  # Adjust this based on your location
+
+# Add it to sys.path
+sys.path.insert(0, MITHRIL_PATH)
+
 import mithril as ml
 import json
 import math
 from pathlib import Path
 from typing import Any
-from mithril.framework.common import IOKey
 from mithril.models import (
     Model,
     Linear,
@@ -22,115 +30,88 @@ from mithril.models import (
     Softmax,
     Concat,
     Buffer,
+    Split,
+    Subtract,
+    IOKey
     
 )
-from mithril.utils import tree_unflatten
 
 
-def RMSNorm(dim: int, name: str | None = None):
+def rms_norm(dim: int, *, name: str | None = None):
+    # TODO: add eps parameter
     # TODO: check original implementation they use astype and cast to float32
+    block = Model(name=name)
     input = IOKey("input")
-    scale = IOKey("scale", shape=[dim])  # TODO: scale must be initialized with ones.
-    rrms = 1 / ((input**2).mean(axis=-1, keepdim=True) + 1e-6).sqrt()
-    # NOTE: Temporarily, we have to use Buffer to attach the functional connections
-    # to the model. This is a workaround for the current limitation of the API.
-    block = Model(name=name)
-    block += Buffer()(rrms, output=IOKey("rrms"))
-    block += Buffer()(input * rrms * scale, output=IOKey("output"))
-
+    weight = IOKey(
+        "weight", shape=[dim], differentiable=True
+    )  # TODO: weight must be initialized with ones.
+    rrms = input / ((input**2).mean(axis=-1, keepdim=True) + 1e-5).sqrt()
+    block += Multiply()(left=rrms, right=weight, output=IOKey("output"))
+    block.set_cin("input")
     return block
 
 
-def RoPE() -> Model:
+def apply_rotary_pos_emb():
     block = Model()
-    # We define the input connections
-    xq = IOKey("xq")
+    xq = IOKey("xq")  # Original shape: (B, H, L, D)
     xk = IOKey("xk")
-    freqs_cis = IOKey("freqs_cis")
+    freqs_cis = IOKey("freqs_cis")  # Shape: (L, D//2, 2)
 
-    xq_shape = xq.shape
-    xk_shape = xk.shape
-    B, L, H = xq_shape[0], xq_shape[1], xq_shape[2]
-    block += Reshape()(xq, shape=(B, L, H, -1, 1, 2), output="xq_")
-    B, L, H = xk_shape[0], xk_shape[1], xk_shape[2]
-    # B,L,H = *xk.shape is not supported yet.
-    block += Reshape()(xk, shape=(B, L, H, -1, 1, 2), output="xk_")
-    # Do the math
-    xq_out = (
-        freqs_cis[..., 0] * block.xq_[..., 0] + freqs_cis[..., 1] * block.xq_[..., 1]  # type: ignore[attr-defined]
-    )
-    xk_out = (
-        freqs_cis[..., 0] * block.xk_[..., 0] + freqs_cis[..., 1] * block.xk_[..., 1]  # type: ignore[attr-defined]
-    )
+    # Get dimensions directly from input shapes
+    B, H, L, D = xq.shape[0], xq.shape[1], xq.shape[2], xq.shape[3]
+    D_half = D // 2  # This must be integer since we're splitting into complex pairs
 
-    # We are explicitly defining the output connections with IOKey
-    block += Reshape()(xq_out, shape=xq_shape, output=IOKey("xq_out"))
-    block += Reshape()(xk_out, shape=xk_shape, output=IOKey("xk_out"))
+    # Reshape queries/keys to complex form
+    block |= Reshape()(xq, shape=(B, H, L, D_half, 2), output="xq_")
+    block |= Reshape()(xk, shape=(B, H, L, D_half, 2), output="xk_")
+
+    # Split frequency components (L, D//2, 2) -> [(L, D//2, 1), (L, D//2, 1)]
+    block |= Split(split_size=2, axis=-1)(freqs_cis, output="freqs_split")
+    
+    # Prepare frequency tensors for broadcasting
+    # Reshape to (1, 1, L, D_half, 1) to match query/key dimensions
+    block |= Reshape()(block.freqs_split[0], shape=(1, 1, L, D_half, 1), output="freqs_cos")
+    block |= Reshape()(block.freqs_split[1], shape=(1, 1, L, D_half, 1), output="freqs_sin")
+
+    # Split complex numbers into real/imaginary parts
+    block |= Split(split_size=2, axis=-1)(block.xq_, output="xq_split")
+    xq_real = block.xq_split[0]  # (B, H, L, D_half, 1)
+    xq_imag = block.xq_split[1]
+
+    # Apply rotary transformations
+    block |= Multiply()(block.freqs_cos, xq_real, output="cos_xq_real")
+    block |= Multiply()(block.freqs_sin, xq_imag, output="sin_xq_imag")
+    block |= Subtract()(block.cos_xq_real, block.sin_xq_imag, output="xq_out_real")
+
+    block |= Multiply()(block.freqs_sin, xq_real, output="sin_xq_real")
+    block |= Multiply()(block.freqs_cos, xq_imag, output="cos_xq_imag")
+    block |= Add()(block.sin_xq_real, block.cos_xq_imag, output="xq_out_imag")
+
+    # Combine real/imaginary and reshape back
+    xqs = {"input1":block.xq_out_real, "input2":block.xq_out_imag}
+    block |= Concat(n=2, axis=-1)(**xqs, output="xq_out_combined")
+    block |= Reshape()(block.xq_out_combined, shape=(B, H, L, D), output=IOKey("xq_out"))
+
+    # Repeat steps 4-6 for keys
+    block |= Split(split_size=2, axis=-1)(block.xk_, output="xk_split")
+    xk_real = block.xk_split[0]
+    xk_imag = block.xk_split[1]
+
+    block |= Multiply()(block.freqs_cos, xk_real, output="cos_xk_real")
+    block |= Multiply()(block.freqs_sin, xk_imag, output="sin_xk_imag")
+    block |= Subtract()(block.cos_xk_real, block.sin_xk_imag, output="xk_out_real")
+
+    block |= Multiply()(block.freqs_sin, xk_real, output="sin_xk_real")
+    block |= Multiply()(block.freqs_cos, xk_imag, output="cos_xk_imag")
+    block |= Add()(block.sin_xk_real, block.cos_xk_imag, output="xk_out_imag")
+
+    xks = {"input1":block.xk_out_real, "input2":block.xk_out_imag}
+    block |= Concat(n=2, axis=-1)(**xks, output="xk_out_combined")
+    block |= Reshape()(block.xk_out_combined, shape=(B, H, L, D), output=IOKey("xk_out"))
+
     return block
 
-def RepeatBlock(repeats: int, axis: int, new_shape: list, name: str = None) -> Model:
-    """
-    Creates a Mithril Model block that simulates a repeat operation along a specified axis.
-
-    Args:
-        repeats (int): Number of times to repeat the values along the axis.
-        axis (int): The axis of the input tensor along which to repeat.
-                    For an input shape of [B, L, D] and repeating along L, use axis=1.
-        new_shape (list): The final shape of the tensor after repeating.
-                          For example, if input is [B, L, D] and you repeat axis 1 by 3 times,
-                          then new_shape should be [B, L * 3, D].
-        name (str, optional): The name of the block.
-    
-    Returns:
-        Model: A Mithril model block that outputs the repeated tensor.
-    """
-    block = Model(name=name)
-    
-    # Step 1: Expand the dimensions.
-    # Since there is no dedicated ExpandDims, we simulate it using Reshape.
-    # For an input of shape [B, L, D] and repeating along axis=1,
-    # we insert a singleton dimension after axis 1 so that the expanded shape is:
-    #    [B, L, 1, D]
-    #
-    # Here we assume the input shape is known. In this example, we use -1 for symbolic dimensions.
-    expanded_shape = [-1, -1, 1, -1]
-    block += Reshape(name="expand")(
-        input=IOKey("input"),
-        output=IOKey("expanded"),
-        shape=expanded_shape
-    )
-    
-    # Step 2: Duplicate the expanded tensor.
-    # We use the Buffer operator as a simple identity to “copy” the tensor.
-    # Create one copy per repetition.
-    copy_keys = []
-    for i in range(repeats):
-        copy_name = f"copy_{i}"
-        block += Buffer(name=copy_name)(
-            IOKey("expanded"),
-            output=IOKey(copy_name)
-        )
-        copy_keys.append(IOKey(copy_name))
-    
-    # Step 3: Concatenate the copies along the newly created axis.
-    # The expanded tensor has shape [B, L, 1, D]. Repeating along axis=1 means we need to
-    # concatenate along the dimension we inserted (i.e. axis = axis + 1; here, axis 2).
-    block += Concat(axis=axis + 1, name="concat")(
-        inputs=copy_keys,
-        output=IOKey("tiled")
-    )
-    
-    # Step 4: Reshape the concatenated tensor to merge the repeated axis back.
-    # After concatenation, for an input originally of shape [B, L, D] and repeats=3,
-    # the tensor now has shape [B, L, 3, D]. We want to reshape it to [B, L * 3, D].
-    block += Reshape(name="reshape")(
-        input=IOKey("tiled"),
-        output=IOKey("output"),
-        shape=new_shape
-    )
-    
-    return block
-
+# Define the llama_attention function in Mithril
 def llama_attention(
     args: dict[str, Any],
     use_mask: bool = False,
@@ -138,21 +119,23 @@ def llama_attention(
     name: str | None = None,
 ):
     n_heads = args["n_heads"]
-    n_kv_heads = args["n_kv_heads"]
+    n_kv_heads = args["n_kv_heads"] #pm.randomize
     head_dim = args["head_dim"]
     dim = args["dim"]
-    rope_traditional = args["rope_traditional"]
     rope_theta = args["rope_theta"]
+    #rope_traditional = args["rope_traditional"] ## ???
+    freqs_cis = IOKey("freqs_cis")
+
 
     repeats = n_heads // n_kv_heads
     scale = head_dim**-0.5
 
     block = Model(name=name)
-    x = IOKey("x", shape=(None, None, dim))
+    x = IOKey("input", shape=(2, 16, dim))
 
-    block += Linear(n_heads * head_dim, name="wq", use_bias=False)(x, output="queries")
-    block += Linear(n_kv_heads * head_dim, name="wk", use_bias=False)(x, output="keys")
-    block += Linear(n_kv_heads * head_dim, name="wv", use_bias=False)(x, output="values")
+    block |= Linear(n_heads * head_dim, name="wq", use_bias=False)(x, output="queries")
+    block |= Linear(n_kv_heads * head_dim, name="wk", use_bias=False)(x, output="keys")
+    block |= Linear(n_kv_heads * head_dim, name="wv", use_bias=False)(x, output="values")
 
     queries: ml.Connection = block.queries  # type: ignore
     keys: ml.Connection = block.keys  # type: ignore
@@ -160,116 +143,156 @@ def llama_attention(
 
     B, L = queries.shape[0], queries.shape[1]
     queries = queries.reshape((B, L, n_heads, -1)).transpose((0, 2, 1, 3))  # type: ignore
-    keys = keys.reshape((B, L, n_kv_heads, -1)).transpose((0, 2, 1, 3))  # type: ignore
-    values = values.reshape((B, L, n_kv_heads, -1)).transpose((0, 2, 1, 3))  # type: ignore
-    
-    def repeat(a, repeats):
-        expanded = [a.expand_dims(2)] * repeats
-        block += Concat(n=repeats, axis=2)(*expanded, output="repeated")
-        return block.repeated.reshape((B, n_heads, L, -1))
-    
-    keys, values = map(repeat, (keys, values))
+    keys    = keys.reshape((B, L, n_kv_heads, -1)).transpose((0, 2, 1, 3))  # type: ignore
+    values  = values.reshape((B, L, n_kv_heads, -1)).transpose((0, 2, 1, 3))  # type: ignore
 
-    block += RoPE()(
-        xq=queries, xk=keys, freqs_cis="pe", xq_out="queries_out", xk_out="keys_out"
+    
+    keys   = keys.reshape((B, n_kv_heads, 1, L, -1)) # * repeats  # type: ignore
+    concat_keys= {f"input{idx+1}": keys for idx in range(repeats)}
+    block |= Concat(n=repeats, axis=2)(**concat_keys, output=IOKey("keys_repeated"))
+    keys = block.keys_repeated.reshape((B, n_heads, L, -1))
+
+    values = values.reshape((B, n_kv_heads, 1, L, -1)) # * repeats  # type: ignore
+    concat_values= {f"input{idx+1}": values for idx in range(repeats)}
+    block |= Concat(n=repeats, axis=2)(**concat_values, output=IOKey("values_repeated"))
+    values = block.values_repeated.reshape((B, n_heads, L, -1))
+
+
+    block |= apply_rotary_pos_emb()(
+        xq=queries, xk=keys, freqs_cis=freqs_cis, xq_out="xq_out", xk_out="xk_out"
     )
-    queries = block.queries_out
-    keys = block.keys_out
+    
+    queries = block.xq_out
+    keys = block.xk_out    
 
     scores = (queries * scale) @ keys.transpose((0, 1, 3, 2))
     if use_mask:
         scores = scores + IOKey("mask").cast(scores.dtype())
 
-    block += Softmax(axis=-1)(scores.cast(ml.float32), output="attention_weights")
+    block |= Softmax(axis=-1)(scores.cast(ml.float32), output="attention_weights")
 
     scores = block.attention_weights.cast(scores.dtype())  # type: ignore
     output = (scores @ values).transpose((0, 2, 1, 3)).reshape((B, L, -1))
-    block += Linear(dim, name="wo", use_bias=False)(output, output=IOKey("output"))
-    block += Buffer()(keys, output=IOKey("keys_out"))
-    block += Buffer()(values, output=IOKey("values_out"))
+    block |= Linear(dim, name="wo", use_bias=False)(output, output=IOKey("output"))
+    block |= Buffer()(keys, output=IOKey("keys_out"))
+    block |= Buffer()(values, output=IOKey("values_out"))
 
     return block
 
-def llama_feed_forward(name: str, dim: int, hidden_dim: int):
-    """
-    Implements the FFN: output = Linear(hidden_dim, dim)( SiLU(Linear(dim, hidden_dim)(x)) * Linear(dim, hidden_dim)(x) )
-    """
-    ffn = Model(name=name)
-    ffn += Linear(dim, hidden_dim, name="w1", use_bias=False)(input="input", output="ffn_w1")
-    ffn += SiLU(name="silu")(input="ffn_w1", output="ffn_silu")
-    ffn += Linear(dim, hidden_dim, name="w3", use_bias=False)(input="input", output="ffn_w3")
-    ffn += Multiply(name="mul")(["ffn_silu", "ffn_w3"], output="ffn_mul")
-    ffn += Linear(hidden_dim, dim, name="w2", use_bias=False)(input="ffn_mul", output="ffn_out")
-    return ffn
-
-
-def transformer_block(
-    name: str,
-    dim: int,
-    n_heads: int,
-    n_kv_heads: int,
-    head_dim: int,
-    hidden_dim: int,
-    norm_eps: float,
-    rope_theta: float,
-    rope_traditional: bool = True,
-):
-    """
-    A single transformer block: (attention + residual) then (FFN + residual).
-    Uses RMSNorm before attention and before the FFN.
-    """
+def feed_forward(args: dict[str, Any], *, name: str | None = None):
     block = Model(name=name)
-    # Attention sub-block
-    block += RMSNorm(dim, eps=norm_eps, name="attn_norm")(input="input", output="norm1")
-    block += llama_attention(
-        "attention", dim, n_heads, n_kv_heads, head_dim, rope_theta, rope_traditional
-    )(input="norm1", output="attn_out")
-    block += Add(name="residual1")(["input", "attn_out"], output="res1")
-    block += RMSNorm(dim, eps=norm_eps, name="ffn_norm")(input="res1", output="norm2")
-    block += llama_feed_forward("ffn", dim, hidden_dim)(input="norm2", output="ffn_out")
-    block += Add(name="residual2")(["res1", "ffn_out"], output="output")
+    x = IOKey("input", shape=(None, None, args["dim"]))
+    
+    # Projections matching MLX's structure
+    block |= Linear(args["hidden_dim"], name="w1", use_bias=False)(x, output="w1_out")
+    block |= Linear(args["hidden_dim"], name="w3", use_bias=False)(x, output="w3_out")
+    
+    # SiLU activation and element-wise multiplication
+    block |= SiLU()(block.w1_out, output="silu_out")
+    block |= Multiply()(block.silu_out, block.w3_out, output="multiplied")
+    
+    # Final projection
+    block |= Linear(args["dim"], name="w2", use_bias=False)(block.multiplied, output=IOKey("output"))
+    
     return block
 
 
-def llama_model(
-    vocab_size: int,
-    dim: int,
-    n_layers: int,
-    n_heads: int,
-    n_kv_heads: int,
-    head_dim: int,
-    hidden_dim: int,
-    norm_eps: float,
-    rope_theta: float,
-    rope_traditional: bool = True,
-):
-    model = Model(name="llama")
+def transformer_block(args: dict[str, Any], use_mask: bool = False, *, name: str | None = None):
+    block = Model(name=name)
+    x = IOKey("input", shape=(2, 16, args["dim"]))  # Match your attention input shape
     
-    # Token and positional embeddings
-    model += Embedding(name="tok_embeddings", num_embeddings=vocab_size, dim=dim)(
-        input="input_ids", output="embedded_tokens"
+    # 1. Attention normalization
+    block |= rms_norm(args["dim"], name="attention_norm")(input=x, output="norm1")
+    
+    # 2. Apply attention with potential mask
+    llama_attn = llama_attention(args, use_mask=use_mask)(
+        input = block.norm1, 
+        freqs_cis=IOKey("freqs_cis"),  # Connect freqs_cis from external input
+        output="attn_out"
+    )
+    block |= llama_attn
+    
+    # 3. First residual connection
+    block |= Add()(x, block.attn_out, output="h_res")
+    
+    # 4. FFN normalization
+    block |= rms_norm(args["dim"], name="ffn_norm")(input=block.h_res, output="norm2")
+    
+    # 5. Apply feed forward
+    block |= feed_forward(args)(input=block.norm2, output="ffn_out")
+    
+    # 6. Second residual connection
+    block |= Add()(block.h_res, block.ffn_out, output="output")
+    #attn_out = block.attn_out
+    
+    # 7. Buffer layers for potential cache (matches MLX's return pattern)
+    block |= Buffer()(llama_attn.model.keys_out, output=IOKey("keys_out")) # Why do we need to use .model here? 
+    block |= Buffer()(llama_attn.model.values_out, output=IOKey("values_out"))
+
+    return block
+
+def precompute_freqs_cis(dim: int, seq_len: int, theta: float = 10000.0):
+    """
+    Compute rotary position embeddings as complex exponentials for LLaMA-style RoPE using NumPy.
+
+    Args:
+        dim (int): Dimension of the model head.
+        seq_len (int): Maximum sequence length.
+        theta (float): Base frequency scaling factor.
+
+    Returns:
+        np.ndarray: Precomputed frequencies of shape [seq_len, dim // 2, 2].
+    """
+    freqs = 1.0 / (theta ** (np.arange(0, dim, 2) / dim))  # Shape: [dim // 2]
+    t = np.arange(seq_len)[:, None]  # Shape: [seq_len, 1]
+    freqs_theta = t * freqs  # Shape: [seq_len, dim // 2]
+
+    # Convert to cosine and sine components
+    freqs_cis = np.stack([np.cos(freqs_theta), np.sin(freqs_theta)], axis=-1)  # Shape: [seq_len, dim // 2, 2]
+
+    return freqs_cis.astype(np.float32)
+
+def llama_model(args: dict[str, Any], *, name: str | None = None):
+    block = Model(name=name)
+    x = IOKey("input", shape=(2, 16))  # Token indices (B, L)
+    
+    # 1. Token embeddings (MLX: self.tok_embeddings)
+    block |= Embedding(
+        num_embeddings=args["vocab_size"],
+        dim=args["dim"],
+        name="tok_embeddings"
+    )(input=x, output="embeddings")
+    
+    # 2. Create causal mask input (MLX: create_additive_causal_mask)
+    mask = IOKey("mask", shape=(1, 1, 16, 16))  # (1, 1, L, L) ##  TODO: Check this shape
+    
+    # 3. Transformer layers (MLX: self.layers)
+    current = block.embeddings
+    for i in range(args["n_layers"]):
+        tb = transformer_block(args, use_mask=True, name=f"layer_{i}")(
+            input=current,
+            freqs_cis=IOKey("freqs_cis"),
+            mask=mask,
+            output=f"layer_{i}_out"
+        )
+        block |= tb
+        current = tb.output
+        # Cache handling (MLX: cache.append(c))
+        # block |= Buffer()(tb.keys_out, output=IOKey(f"keys_{i}"))
+        # block |= Buffer()(tb.values_out, output=IOKey(f"values_{i}"))
+    
+    # 4. Final normalization (MLX: self.norm)
+    block |= rms_norm(args["dim"], name="norm")(
+        input=current, 
+        output="norm_out"
     )
     
-    # Transformer blocks
-    layers = Model(name="layers")
-    for i in range(n_layers):
-        layers += transformer_block(
-            name=f"layer_{i}",
-            dim=dim,
-            n_heads=n_heads,
-            n_kv_heads=n_kv_heads,
-            head_dim=head_dim,
-            hidden_dim=hidden_dim,
-            norm_eps=norm_eps,
-            rope_theta=rope_theta,
-            rope_traditional=rope_traditional,
-        )(input="layer_in", output="layer_out")
-        layers.set_cin("layer_in")
+    # 5. Output projection (MLX: self.output)
+    block |= Linear(
+        input_dim=args["dim"],
+        output_dim=args["vocab_size"], 
+        name="output", 
+        use_bias=False
+    )(input=block.norm_out, output="logits")
     
-    model += layers(input="embedded_tokens")
-    
-    # Final normalization and output layer
-    model += RMSNorm(dim, eps=norm_eps, name="final_norm")(input="layer_out", output="norm_out")
-    model += Linear(dim, vocab_size, name="output_layer")(input="norm_out", output="logits")
-    
-    return model
+    return block
