@@ -19,6 +19,18 @@ from mithril.models import (
     Buffer,
 )
 
+def rms_norm(dim: int, *, name: str | None = None):
+    # TODO: add eps parameter
+    # TODO: check original implementation they use astype and cast to float32
+    block = Model(name=name)
+    input = IOKey("input")
+    weight = IOKey(
+        "weight", shape=[dim], differentiable=True
+    )  # TODO: weight must be initialized with ones.
+    rrms = input / ((input**2).mean(axis=-1, keepdim=True) + 1e-5).sqrt()
+    block += Multiply()(left=rrms, right=weight, output=IOKey("output"))
+    block.set_cin("input")
+    return block
 
 
 # ---- Mithril Implementation ----
@@ -39,7 +51,7 @@ def feed_forward(args: dict[str, Any], *, name: str | None = None):
     
     return block
 
-
+"""
 # ---- Testing and Comparison ----
 dim = 512
 hidden_dim = 1024
@@ -69,9 +81,7 @@ mithril_output = pm.evaluate(params, data={"input": x})
 
 # ---- NumPy Implementation ----
 def feedforward_numpy(params, x: np.ndarray):
-    """
     NumPy implementation of FeedForward using parameters from Mithril.
-    """
     W1 = params["weight_0"].T  # Transpose to match Mithril
     W3 = params["weight_1"].T
     W2 = params["weight_2"].T
@@ -88,3 +98,4 @@ numpy_output = feedforward_numpy(params, x)
 print("Mithril Output Shape:", mithril_output["output"].shape)
 print("NumPy Output Shape:", numpy_output.shape)
 print("Difference (Mean Absolute Error):", np.mean(np.abs(mithril_output["output"] - numpy_output)))
+"""

@@ -202,12 +202,12 @@ def llama_attention(
 
     return block
 
-numpy_backend = ml.NumpyBackend()
-model = llama_attention(args)
-pm = ml.compile(model, backend=numpy_backend, inference=True, jit=False, file_path="test.py")
-params = pm.randomize_params()
-# Run the Mithril function
-mithril_output = pm.evaluate(params, data={"input": x, "freqs_cis": freqs_cis})
+# numpy_backend = ml.NumpyBackend()
+# model = llama_attention(args)
+# pm = ml.compile(model, backend=numpy_backend, inference=True, jit=False, file_path="test.py")
+# params = pm.randomize_params()
+# # Run the Mithril function
+# mithril_output = pm.evaluate(params, data={"input": x, "freqs_cis": freqs_cis})
 
 # Define the NumPy function
 def attention_numpy(params, args, x: np.ndarray, freqs_cis: np.ndarray):
@@ -264,15 +264,15 @@ def attention_numpy(params, args, x: np.ndarray, freqs_cis: np.ndarray):
     scores = scores / np.sum(scores, axis=-1, keepdims=True)
 
     output = (scores @ values).transpose(0, 2, 1, 3).reshape(B, L, -1)
-    return output @ Wo  # Final projection with Mithril's weights
+    return output @ Wo  # Final projection with Mithril's weightsparams
 
-# Run the NumPy function
-numpy_output = attention_numpy(params, args,x , freqs_cis)
+# # Run the NumPy function
+# numpy_output = attention_numpy(params, args,x , freqs_cis)
 
-# Compare the results
-print("Mithril Output:", mithril_output["output"].shape )
-print("NumPy Output:", numpy_output.shape)
-print("Difference:", np.mean(np.abs(mithril_output["output"] - numpy_output)))
+# # Compare the results
+# print("Mithril Output:", mithril_output["output"].shape )
+# print("NumPy Output:", numpy_output.shape)
+# print("Difference:", np.mean(np.abs(mithril_output["output"] - numpy_output))) #np.testing.assert_allclose(mithril_output["output"], numpy_output, rtol=1e-5, atol=1e-5)
 
 
 

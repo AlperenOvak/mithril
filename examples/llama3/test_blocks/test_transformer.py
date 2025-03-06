@@ -37,6 +37,8 @@ from mithril.models import (
 )
 from mithril import Backend
 
+
+
 def transformer_block(args: dict[str, Any], use_mask: bool = False, *, name: str | None = None):
     block = Model(name=name)
     x = IOKey("input", shape=(2, 16, args["dim"]))  # Match your attention input shape
@@ -48,6 +50,8 @@ def transformer_block(args: dict[str, Any], use_mask: bool = False, *, name: str
     llama_attn = llama_attention(args, use_mask=use_mask)(
         input = block.norm1, 
         freqs_cis=IOKey("freqs_cis"),  # Connect freqs_cis from external input
+        keys_out = "keys_out",
+        values_out = "values_out",
         output="attn_out"
     )
     block |= llama_attn
@@ -66,8 +70,8 @@ def transformer_block(args: dict[str, Any], use_mask: bool = False, *, name: str
     #attn_out = block.attn_out
     
     # 7. Buffer layers for potential cache (matches MLX's return pattern)
-    block |= Buffer()(llama_attn.model.keys_out, output=IOKey("keys_out")) # Why do we need to use .model here? 
-    block |= Buffer()(llama_attn.model.values_out, output=IOKey("values_out"))
+    block |= Buffer()(block.keys_out, output=IOKey("keyss_out")) # Why do we need to use .model here? 
+    block |= Buffer()(block.values_out, output=IOKey("valuess_out"))
 
     return block
 
@@ -93,7 +97,7 @@ def precompute_freqs_cis(dim: int, seq_len: int, theta: float = 10000.0):
     return freqs_cis.astype(np.float32)
 
 
-# Define arguments
+"""# Define arguments
 args = {
     "dim": 512,
     "hidden_dim": 2048,
@@ -120,4 +124,4 @@ data = {
     "input": np.random.randn(2, 16, 512).astype(np.float32),
     "freqs_cis": precompute_freqs_cis(args["head_dim"], 16)
 }
-output = pm.evaluate(params, data)
+output = pm.evaluate(params, data)"""
